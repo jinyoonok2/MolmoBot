@@ -5,12 +5,59 @@ from molmobot_spoc.eval.config.spoc_policy_configs import (
 )
 from pathlib import Path
 import datetime
+import logging
+import os
+import socket
 from molmo_spaces.configs.robot_configs import RBY1MConfig
 from molmo_spaces.configs.camera_configs import RBY1GoProD455CameraSystem
 from molmo_spaces.evaluation.configs.evaluation_configs import JsonBenchmarkEvalConfig
 from huggingface_hub import snapshot_download
 
 TIMESTAMP = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+log = logging.getLogger(__name__)
+
+
+def _snapshot_download_ipv4(repo_id: str) -> str:
+    """Download a Hugging Face snapshot using IPv4 only.
+
+    This machine has working IPv4 access to Hugging Face but broken IPv6 access, which
+    can make `snapshot_download` hang before it notices the local cache.
+    """
+
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+    os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "60")
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
+
+    original_getaddrinfo = socket.getaddrinfo
+
+    def ipv4_getaddrinfo(*args, **kwargs):
+        return [
+            info
+            for info in original_getaddrinfo(*args, **kwargs)
+            if info[0] == socket.AF_INET
+        ]
+
+    socket.getaddrinfo = ipv4_getaddrinfo
+    try:
+        return snapshot_download(repo_id)
+    finally:
+        socket.getaddrinfo = original_getaddrinfo
+
+
+def _resolve_hf_snapshot(repo_id: str) -> str:
+    """Resolve a checkpoint snapshot, preferring the local cache."""
+
+    try:
+        path = snapshot_download(repo_id, local_files_only=True)
+        log.info("Using cached Hugging Face snapshot for %s: %s", repo_id, path)
+        return path
+    except Exception as exc:
+        log.info(
+            "No cached Hugging Face snapshot for %s, downloading with IPv4 only: %s",
+            repo_id,
+            exc,
+        )
+        return _snapshot_download_ipv4(repo_id)
 
 
 class RBY1EvalBaseConfig(JsonBenchmarkEvalConfig):
@@ -51,7 +98,7 @@ class RBY1EvalBaseConfig(JsonBenchmarkEvalConfig):
         self.robot_config.action_noise_config.enabled = False
         assert self.task_type != "", "Set the task_type in the eval config."
         if self.hf_model_name is not None:
-            self.policy_config.checkpoint_dir = snapshot_download(self.hf_model_name)
+            self.policy_config.checkpoint_dir = _resolve_hf_snapshot(self.hf_model_name)
 
 
 class RBY1ArticulatedManipEvalConfig(RBY1EvalBaseConfig):

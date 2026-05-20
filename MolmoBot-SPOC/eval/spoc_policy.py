@@ -43,7 +43,8 @@ class SPOCModelPolicy(InferencePolicy):
         config: MlSpacesExpConfig,
         task_type,
     ):
-        super().__init__(config, task_type)
+        # Current MolmoSpaces InferencePolicy only accepts the experiment config.
+        super().__init__(config)
         # Ensure patch is applied (important for multiprocessing workers)
         _patch_save_utils_at_import()
         self.device = torch.device(config.policy_config.device)
