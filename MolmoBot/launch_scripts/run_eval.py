@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import inspect
 import importlib
 from pathlib import Path
 
@@ -44,8 +45,14 @@ def main():
     parser.add_argument(
         "--task_horizon",
         type=int,
-        default=600,
-        help="Maximum steps per episode",
+        default=None,
+        help="Maximum steps per episode. If omitted, uses the benchmark/config default.",
+    )
+    parser.add_argument(
+        "--idx",
+        type=int,
+        default=None,
+        help="Evaluate a single benchmark episode index. If omitted, evaluates all episodes.",
     )
     parser.add_argument(
         "--output_dir",
@@ -90,18 +97,23 @@ def main():
         module_path, class_name = eval_config_cls.split(":")
         eval_config_cls = getattr(importlib.import_module(module_path), class_name)
 
-    results = run_evaluation(
-        eval_config_cls=eval_config_cls,
-        benchmark_dir=Path(args.benchmark_path),
-        checkpoint_path=Path(args.checkpoint_path),
-        task_horizon_steps=args.task_horizon,
-        output_dir=args.output_dir,
-        num_workers=args.num_workers,
-        use_wandb=args.use_wandb,
-        wandb_project=args.wandb_project,
-        use_filament=args.use_filament,
-        environment_light_intensity=args.environment_light_intensity,
-    )
+    eval_kwargs = {
+        "eval_config_cls": eval_config_cls,
+        "benchmark_dir": Path(args.benchmark_path),
+        "checkpoint_path": Path(args.checkpoint_path),
+        "task_horizon_steps": args.task_horizon,
+        "output_dir": args.output_dir,
+        "num_workers": args.num_workers,
+        "use_wandb": args.use_wandb,
+        "wandb_project": args.wandb_project,
+        "use_filament": args.use_filament,
+        "environment_light_intensity": args.environment_light_intensity,
+        "episode_idx": args.idx,
+    }
+
+    supported_args = set(inspect.signature(run_evaluation).parameters)
+    eval_kwargs = {k: v for k, v in eval_kwargs.items() if k in supported_args}
+    results = run_evaluation(**eval_kwargs)
 
     print(f"Success rate: {results.success_rate:.1%}")
     for r in results.episode_results:

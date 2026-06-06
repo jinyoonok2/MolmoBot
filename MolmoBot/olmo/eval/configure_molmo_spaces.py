@@ -1,4 +1,5 @@
 import logging
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -35,14 +36,15 @@ class SynthVLAPolicy(InferencePolicy, StatefulPolicy):
         config: MlSpacesExpConfig,
         task_type: str,
     ):
-        super().__init__(config, task_type)
+        super().__init__(config)
+        self.task = task_type
         self.camera_names = config.policy_config.camera_names
         self.action_move_group_names = config.policy_config.action_move_group_names
         self.action_spec = config.policy_config.action_spec
         self.action_horizon = config.policy_config.action_horizon
         self.execute_horizon = config.policy_config.execute_horizon
         self.action_type = config.policy_config.action_type
-        self.relative_max_joint_delta = config.policy_config.relative_max_joint_delta
+        self.relative_max_joint_delta = getattr(config.policy_config, "relative_max_joint_delta", None)
         if self.relative_max_joint_delta is not None:
             self.relative_max_joint_delta = np.array(self.relative_max_joint_delta)
 
@@ -81,7 +83,8 @@ class SynthVLAPolicy(InferencePolicy, StatefulPolicy):
 
         checkpoint_path = self.config.policy_config.checkpoint_path
         # logger.info(f"Loading SynthManipMolmoInferenceWrapper from: {checkpoint_path}")
-        self.agent = SynthManipMolmoInferenceWrapper(checkpoint_path=checkpoint_path, states_mode=self.config.policy_config.states_mode)
+        states_mode = getattr(self.config.policy_config, "states_mode", "cross_attn")
+        self.agent = SynthManipMolmoInferenceWrapper(checkpoint_path=checkpoint_path, states_mode=states_mode)
         # logger.info("SynthManipMolmoInferenceWrapper loaded successfully")
 
     def reset(self):
@@ -196,25 +199,28 @@ class SynthVLAPolicy(InferencePolicy, StatefulPolicy):
         self.buffer_index += 1
         self.step_count += 1
 
-        if self.action_type == "joint_pos_rel":
-            predicted_deltas = action["arm"][:7]
-
-            relative_scale = np.abs(predicted_deltas) / self.relative_max_joint_delta
-            if np.max(relative_scale) > 1:
-                scaled_predicted_deltas = predicted_deltas / np.max(relative_scale)
-                action["arm"][:7] = scaled_predicted_deltas
-
-        else:
-            # calculate joint deltas
+        if self.relative_max_joint_delta is not None:
             obs = model_input[0] if isinstance(model_input, list) else model_input
-            predicted_deltas = action["arm"][:7] - obs["robot_state"]["qpos"]["arm"]
+            qpos = obs.get("qpos", obs.get("robot_state", {}).get("qpos", {}))
 
-            # Find the largest value
-            relative_scale = np.abs(predicted_deltas) / self.relative_max_joint_delta
+            for group_name in action:
+                if group_name != "arm" and not group_name.endswith("_arm"):
+                    continue
 
-            if np.max(relative_scale) > 1:
-                scaled_predicted_deltas = predicted_deltas / np.max(relative_scale)
-                action["arm"][:7] = obs["robot_state"]["qpos"]["arm"] + scaled_predicted_deltas
+                if self.action_type == "joint_pos_rel":
+                    predicted_deltas = action[group_name][:7]
+                    current_qpos = None
+                else:
+                    current_qpos = qpos[group_name][:7]
+                    predicted_deltas = action[group_name][:7] - current_qpos
+
+                relative_scale = np.abs(predicted_deltas) / self.relative_max_joint_delta
+                if np.max(relative_scale) > 1:
+                    scaled_predicted_deltas = predicted_deltas / np.max(relative_scale)
+                    if current_qpos is None:
+                        action[group_name][:7] = scaled_predicted_deltas
+                    else:
+                        action[group_name][:7] = current_qpos + scaled_predicted_deltas
 
         return action
 
@@ -470,6 +476,7 @@ class MolmoBotRBY1DoorOpeningPolicy(SynthVLAPolicy):
         self.use_point_prompts: bool = getattr(pc, "use_point_prompts", False)
         self.point_prompt_camera: str = getattr(pc, "point_prompt_camera", "head_camera")
         self.max_conditioning_points: int = getattr(pc, "max_conditioning_points", 1)
+        self.clamp_gripper: bool = getattr(pc, "clamp_gripper", True)
         self.gripper_threshold: float = getattr(pc, "gripper_threshold", 5.0)
         self._conditioning_points: dict | None = None
         self._logged_obs_keys: bool = False
@@ -695,13 +702,52 @@ class MolmoBotRBY1MultitaskPolicy(MolmoBotRBY1DoorOpeningPolicy):
         self.state_spec: dict[str, int] = getattr(pc, "state_spec", {})
         self.state_indices: dict[str, list[int]] = getattr(pc, "state_indices", {})
         self.use_conditioning_image: bool = getattr(pc, "use_conditioning_image", False)
+        self.gripper_output_mode: str = os.environ.get(
+            "RBY1_GRIPPER_OUTPUT_MODE",
+            getattr(pc, "gripper_output_mode", "raw"),
+        )
+        self.gripper_binary_threshold: float = float(
+            os.environ.get(
+                "RBY1_GRIPPER_BINARY_THRESHOLD",
+                getattr(pc, "gripper_binary_threshold", 0.0),
+            )
+        )
+        self.gripper_open_position: float = float(
+            os.environ.get(
+                "RBY1_GRIPPER_OPEN_POSITION",
+                getattr(pc, "gripper_open_position", -0.05),
+            )
+        )
+        self.gripper_closed_position: float = float(
+            os.environ.get(
+                "RBY1_GRIPPER_CLOSED_POSITION",
+                getattr(pc, "gripper_closed_position", 0.0),
+            )
+        )
         self._conditioning_image: np.ndarray | None = None
+        self._debug_chunks_logged: int = 0
 
         super().__init__(config, task_type)
 
     def reset(self):
         super().reset()
         self._conditioning_image = None
+        self._debug_chunks_logged = 0
+
+    def _convert_gripper_action(self, selected_action: np.ndarray) -> np.ndarray:
+        if self.gripper_output_mode == "binary_rby1":
+            return np.where(
+                selected_action >= self.gripper_binary_threshold,
+                self.gripper_closed_position,
+                self.gripper_open_position,
+            ).astype(selected_action.dtype)
+        if self.gripper_output_mode == "binary_rby1_inverted":
+            return np.where(
+                selected_action >= self.gripper_binary_threshold,
+                self.gripper_open_position,
+                self.gripper_closed_position,
+            ).astype(selected_action.dtype)
+        return selected_action
 
     def get_state(self):
         state = super().get_state()
@@ -799,6 +845,47 @@ class MolmoBotRBY1MultitaskPolicy(MolmoBotRBY1DoorOpeningPolicy):
             state=state,
         )
 
+        if self._debug_chunks_logged < 3:
+            image_shapes = [getattr(image, "shape", None) for image in images]
+            logger.info(
+                "RBY1 multitask debug chunk %d: goal=%r state_shape=%s "
+                "state_min=%.4f state_max=%.4f image_shapes=%s pred_shape=%s",
+                self._debug_chunks_logged,
+                goal,
+                state.shape,
+                float(np.nanmin(state)),
+                float(np.nanmax(state)),
+                image_shapes,
+                pred_actions.shape,
+            )
+
+            start_idx = 0
+            for group_name in self.action_move_group_names:
+                dim = self.action_spec[group_name]
+                chunk = pred_actions[:, start_idx : start_idx + dim]
+                if "gripper" in group_name:
+                    converted = self._convert_gripper_action(chunk)
+                    logger.info(
+                        "RBY1 multitask debug chunk %d: %s raw min=%.4f max=%.4f "
+                        "mean=%.4f first_values=%s converted_min=%.4f converted_max=%.4f "
+                        "mode=%s binary_threshold=%.4f clamp_gripper=%s threshold=%.4f",
+                        self._debug_chunks_logged,
+                        group_name,
+                        float(np.nanmin(chunk)),
+                        float(np.nanmax(chunk)),
+                        float(np.nanmean(chunk)),
+                        np.array2string(chunk[: min(8, len(chunk))].reshape(-1), precision=3),
+                        float(np.nanmin(converted)),
+                        float(np.nanmax(converted)),
+                        self.gripper_output_mode,
+                        self.gripper_binary_threshold,
+                        self.clamp_gripper,
+                        self.gripper_threshold,
+                    )
+                start_idx += dim
+
+            self._debug_chunks_logged += 1
+
         # --- Convert to list of action dicts ---
         self.action_buffer = []
         for t in range(pred_actions.shape[0]):
@@ -811,6 +898,8 @@ class MolmoBotRBY1MultitaskPolicy(MolmoBotRBY1DoorOpeningPolicy):
                     action[group_name] = np.where(
                         selected_action >= self.gripper_threshold, 100.0, -100.0
                     ).astype(selected_action.dtype)
+                elif "gripper" in group_name:
+                    action[group_name] = self._convert_gripper_action(selected_action)
                 else:
                     action[group_name] = selected_action
                 start_idx += dim
@@ -858,6 +947,10 @@ class MolmoBotRBY1PickPnPPolicyConfig(MolmoBotRBY1PolicyConfig):
     """Policy config for MolmoBot RBY1 pick+pnp with torso, no points, no conditioning."""
 
     clamp_gripper: bool = False  # Disable gripper clamping for pick/pnp
+    gripper_output_mode: str = "raw"
+    gripper_binary_threshold: float = 0.0
+    gripper_open_position: float = -0.05
+    gripper_closed_position: float = 0.0
 
     action_move_group_names: list[str] = [
         "base", "left_arm", "left_gripper", "right_arm", "right_gripper", "torso",
