@@ -88,6 +88,11 @@ def main():
         default=None,
         help="Intensity of default environmental light (filament only)",
     )
+    parser.add_argument(
+        "--terminate_upon_success",
+        action="store_true",
+        help="Stop each episode as soon as the benchmark success condition is reached.",
+    )
     args = parser.parse_args()
 
     # Resolve module:ClassName string to actual class so mujoco-thor uses __name__
@@ -109,6 +114,7 @@ def main():
         "use_filament": args.use_filament,
         "environment_light_intensity": args.environment_light_intensity,
         "episode_idx": args.idx,
+        "terminate_upon_success": args.terminate_upon_success,
     }
 
     supported_args = set(inspect.signature(run_evaluation).parameters)
