@@ -8,7 +8,7 @@ from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
 from molmo_spaces.configs.camera_configs import RBY1GoProD455CameraSystem
 from molmo_spaces.configs.robot_configs import FrankaRobotConfig, RBY1MConfig
 from molmo_spaces.configs.policy_configs import BasePolicyConfig
-from molmo_spaces.policy.base_policy import InferencePolicy, StatefulPolicy
+from molmo_spaces.policy.base_policy import BasePolicy, InferencePolicy, StatefulPolicy
 from molmo_spaces.evaluation.configs.evaluation_configs import JsonBenchmarkEvalConfig
 
 logger = logging.getLogger(__name__)
@@ -47,6 +47,8 @@ class SynthVLAPolicy(InferencePolicy, StatefulPolicy):
         self.relative_max_joint_delta = getattr(config.policy_config, "relative_max_joint_delta", None)
         if self.relative_max_joint_delta is not None:
             self.relative_max_joint_delta = np.array(self.relative_max_joint_delta)
+        self.action_generator_seed = self._resolve_action_generator_seed()
+        self._action_generator: torch.Generator | None = None
 
         self.action_buffer: list[dict[str, np.ndarray]] = []
         self.buffer_index = 0
@@ -59,6 +61,28 @@ class SynthVLAPolicy(InferencePolicy, StatefulPolicy):
         # Default obs is 1 and delta is 8
         self.input_window_size = getattr(self.agent.model_config , "n_obs_steps", 1)
         self.obs_step_delta = getattr(self.agent.model_config , "obs_step_delta", 8)
+        self._reset_action_generator()
+
+    def _resolve_action_generator_seed(self) -> int | None:
+        raw_seed = os.environ.get(
+            "RBY1_MODEL_ACTION_SEED",
+            getattr(self.config.policy_config, "action_generator_seed", None),
+        )
+        if raw_seed in (None, ""):
+            return None
+        if isinstance(raw_seed, str) and raw_seed.strip().lower() in {"none", "null", "off"}:
+            return None
+        return int(raw_seed)
+
+    def _reset_action_generator(self) -> None:
+        if self.action_generator_seed is None:
+            self._action_generator = None
+            return
+
+        device = getattr(self.agent, "device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        self._action_generator = torch.Generator(device=device)
+        self._action_generator.manual_seed(self.action_generator_seed)
+        logger.info("Using seeded MolmoBot action generator: seed=%d device=%s", self.action_generator_seed, device)
 
     def get_state(self):
         return SynthVLAPolicyState(
@@ -92,6 +116,7 @@ class SynthVLAPolicy(InferencePolicy, StatefulPolicy):
         self.buffer_index = 0
         self.step_count = 0
         self.obs_history = []
+        self._reset_action_generator()
 
     def _populate_action_buffer(self, observation) -> None:
         """Call agent to get new action chunk and populate the buffer."""
@@ -155,6 +180,7 @@ class SynthVLAPolicy(InferencePolicy, StatefulPolicy):
             images=images,
             task_description=goal,
             state=state,
+            generator=self._action_generator,
         )
 
         # logger.info(f"Predicted action chunk: shape={pred_actions.shape}")
@@ -251,6 +277,7 @@ class SynthVLAPolicyConfig(BasePolicyConfig):
     }
     action_horizon: int = 16  # Number of action steps predicted per chunk
     execute_horizon: int = 8  # Number of actions to execute before re-querying
+    action_generator_seed: int | None = None
 
     clamp_gripper: bool = True
     gripper_representation_count: int = 1  # Number of gripper state values to input
@@ -405,6 +432,7 @@ class SynthVLARBY1PolicyConfig(BasePolicyConfig):
     }
     action_horizon: int = 16
     execute_horizon: int = 8
+    action_generator_seed: int | None = None
 
     clamp_gripper: bool = True
     gripper_representation_count: int = 1
@@ -563,6 +591,7 @@ class MolmoBotRBY1DoorOpeningPolicy(SynthVLAPolicy):
             images=images,
             task_description=goal,
             state=state,
+            generator=self._action_generator,
         )
 
         # --- Convert to list of action dicts ---
@@ -843,6 +872,7 @@ class MolmoBotRBY1MultitaskPolicy(MolmoBotRBY1DoorOpeningPolicy):
             images=images,
             task_description=goal,
             state=state,
+            generator=self._action_generator,
         )
 
         if self._debug_chunks_logged < 3:
@@ -1006,3 +1036,162 @@ class MolmoBotRBY1PickPnPEvalConfig(MolmoBotRBY1EvalConfig):
         super().model_post_init(__context)
         # Model outputs 1D torso action → use "height" mode (scalar → 6D joint mapping)
         self.robot_config.command_mode["torso"] = "height"
+
+
+class RBY1RecordedTrajectoryPolicyConfig(BasePolicyConfig):
+    """Policy config for replaying recorded MolmoBot-data RBY1 action traces."""
+
+    policy_type: str = "recorded_trajectory"
+    policy_cls: type = None
+    trajectory_path: str | None = None
+    trajectory_key: str = "traj_0"
+    action_dataset: str = "commanded_action"
+    action_start_index: int = 1  # frame 0 is padding in saved MolmoSpaces trajectories
+    action_move_group_names: list[str] = [
+        "base",
+        "left_arm",
+        "left_gripper",
+        "right_arm",
+        "right_gripper",
+        "torso",
+    ]
+    action_keys: dict[str, str] = {
+        "base": "joint_pos",
+        "left_arm": "joint_pos",
+        "left_gripper": "joint_pos",
+        "right_arm": "joint_pos",
+        "right_gripper": "joint_pos",
+        "torso": "joint_pos",
+    }
+    camera_names: list[str] = ["wrist_camera_r", "head_camera", "wrist_camera_l"]
+
+    def model_post_init(self, __context) -> None:
+        if self.policy_cls is None:
+            from olmo.eval.configure_molmo_spaces import RBY1RecordedTrajectoryPolicy
+
+            object.__setattr__(self, "policy_cls", RBY1RecordedTrajectoryPolicy)
+
+
+class RBY1RecordedTrajectoryPolicy(BasePolicy):
+    """Replay recorded per-step actions from a MolmoSpaces trajectory H5 file."""
+
+    def __init__(self, config: MlSpacesExpConfig, task) -> None:
+        super().__init__(config, task)
+        pc = config.policy_config
+        self.trajectory_path = os.environ.get(
+            "RBY1_REPLAY_TRAJECTORY_PATH",
+            getattr(pc, "trajectory_path", None) or "",
+        )
+        self.trajectory_key = os.environ.get(
+            "RBY1_REPLAY_TRAJECTORY_KEY",
+            getattr(pc, "trajectory_key", "traj_0"),
+        )
+        self.action_dataset = os.environ.get(
+            "RBY1_REPLAY_ACTION_DATASET",
+            getattr(pc, "action_dataset", "commanded_action"),
+        )
+        self.action_start_index = int(
+            os.environ.get(
+                "RBY1_REPLAY_ACTION_START_INDEX",
+                getattr(pc, "action_start_index", 1),
+            )
+        )
+        self.action_move_group_names = list(getattr(pc, "action_move_group_names", []))
+        self.actions = self._load_actions()
+        self.step_index = 0
+
+    @staticmethod
+    def _decode_json_row(row: np.ndarray) -> dict:
+        import json
+
+        raw = row.tobytes().decode("utf-8").rstrip("\x00")
+        return json.loads(raw) if raw else {}
+
+    def _load_actions(self) -> list[dict[str, np.ndarray]]:
+        if not self.trajectory_path:
+            raise ValueError(
+                "Recorded replay requires RBY1_REPLAY_TRAJECTORY_PATH or "
+                "policy_config.trajectory_path"
+            )
+
+        import h5py
+
+        actions: list[dict[str, np.ndarray]] = []
+        with h5py.File(self.trajectory_path, "r") as f:
+            action_group = f[self.trajectory_key]["actions"]
+            if self.action_dataset not in action_group:
+                raise KeyError(
+                    f"Missing actions/{self.action_dataset} in {self.trajectory_path}; "
+                    f"available={list(action_group.keys())}"
+                )
+            dataset = action_group[self.action_dataset]
+            for frame_idx in range(self.action_start_index, dataset.shape[0]):
+                frame = self._decode_json_row(dataset[frame_idx])
+                if not frame:
+                    continue
+                action: dict[str, np.ndarray] = {}
+                for move_group in self.action_move_group_names:
+                    if move_group not in frame:
+                        continue
+                    action[move_group] = np.asarray(frame[move_group], dtype=np.float32)
+                actions.append(action)
+
+        if not actions:
+            raise ValueError(
+                f"No replayable actions decoded from {self.trajectory_path}:{self.trajectory_key}"
+            )
+        logger.info(
+            "Loaded %d recorded actions from %s:%s",
+            len(actions),
+            self.trajectory_path,
+            self.trajectory_key,
+        )
+        return actions
+
+    def reset(self):
+        self.step_index = 0
+
+    def get_action(self, observation):
+        if self.step_index >= len(self.actions):
+            return {"done": True}
+        action = self.actions[self.step_index]
+        self.step_index += 1
+        return action
+
+    def get_info(self) -> dict:
+        return {
+            "policy_type": "recorded_trajectory",
+            "trajectory_path": self.trajectory_path,
+            "trajectory_key": self.trajectory_key,
+            "action_dataset": self.action_dataset,
+            "step_index": self.step_index,
+            "num_actions": len(self.actions),
+        }
+
+    def get_phase(self) -> str:
+        return "replay"
+
+    def get_all_phases(self) -> dict[str, int]:
+        return {"replay": 0}
+
+
+class RBY1RecordedTrajectoryEvalConfig(SynthVLARBY1EvalConfig):
+    """Eval config that replays absolute actions recorded in MolmoBot-data."""
+
+    policy_config: RBY1RecordedTrajectoryPolicyConfig = RBY1RecordedTrajectoryPolicyConfig()
+    robot_config: RBY1MConfig = RBY1MConfig()
+    camera_config: RBY1GoProD455CameraSystem = RBY1GoProD455CameraSystem()
+    policy_dt_ms: float = 100.0
+    ctrl_dt_ms: float = 20.0
+    sim_dt_ms: float = 4.0
+    task_horizon: int = 400
+
+    def model_post_init(self, __context) -> None:
+        super().model_post_init(__context)
+        # Replay uses the absolute commands saved under actions/commanded_action.
+        self.robot_config.action_noise_config.enabled = False
+        self.robot_config.command_mode["base"] = "holo_joint_planar_position"
+        self.robot_config.command_mode["arm"] = "joint_position"
+        self.robot_config.command_mode["gripper"] = "joint_position"
+        self.robot_config.command_mode["head"] = None
+        self.robot_config.command_mode["torso"] = "joint_position"
