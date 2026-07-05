@@ -731,28 +731,6 @@ class MolmoBotRBY1MultitaskPolicy(MolmoBotRBY1DoorOpeningPolicy):
         self.state_spec: dict[str, int] = getattr(pc, "state_spec", {})
         self.state_indices: dict[str, list[int]] = getattr(pc, "state_indices", {})
         self.use_conditioning_image: bool = getattr(pc, "use_conditioning_image", False)
-        self.gripper_output_mode: str = os.environ.get(
-            "RBY1_GRIPPER_OUTPUT_MODE",
-            getattr(pc, "gripper_output_mode", "raw"),
-        )
-        self.gripper_binary_threshold: float = float(
-            os.environ.get(
-                "RBY1_GRIPPER_BINARY_THRESHOLD",
-                getattr(pc, "gripper_binary_threshold", 0.0),
-            )
-        )
-        self.gripper_open_position: float = float(
-            os.environ.get(
-                "RBY1_GRIPPER_OPEN_POSITION",
-                getattr(pc, "gripper_open_position", -0.05),
-            )
-        )
-        self.gripper_closed_position: float = float(
-            os.environ.get(
-                "RBY1_GRIPPER_CLOSED_POSITION",
-                getattr(pc, "gripper_closed_position", 0.0),
-            )
-        )
         self._conditioning_image: np.ndarray | None = None
         self._debug_chunks_logged: int = 0
 
@@ -762,21 +740,6 @@ class MolmoBotRBY1MultitaskPolicy(MolmoBotRBY1DoorOpeningPolicy):
         super().reset()
         self._conditioning_image = None
         self._debug_chunks_logged = 0
-
-    def _convert_gripper_action(self, selected_action: np.ndarray) -> np.ndarray:
-        if self.gripper_output_mode == "binary_rby1":
-            return np.where(
-                selected_action >= self.gripper_binary_threshold,
-                self.gripper_closed_position,
-                self.gripper_open_position,
-            ).astype(selected_action.dtype)
-        if self.gripper_output_mode == "binary_rby1_inverted":
-            return np.where(
-                selected_action >= self.gripper_binary_threshold,
-                self.gripper_open_position,
-                self.gripper_closed_position,
-            ).astype(selected_action.dtype)
-        return selected_action
 
     def get_state(self):
         state = super().get_state()
@@ -894,21 +857,15 @@ class MolmoBotRBY1MultitaskPolicy(MolmoBotRBY1DoorOpeningPolicy):
                 dim = self.action_spec[group_name]
                 chunk = pred_actions[:, start_idx : start_idx + dim]
                 if "gripper" in group_name:
-                    converted = self._convert_gripper_action(chunk)
                     logger.info(
                         "RBY1 multitask debug chunk %d: %s raw min=%.4f max=%.4f "
-                        "mean=%.4f first_values=%s converted_min=%.4f converted_max=%.4f "
-                        "mode=%s binary_threshold=%.4f clamp_gripper=%s threshold=%.4f",
+                        "mean=%.4f first_values=%s clamp_gripper=%s threshold=%.4f",
                         self._debug_chunks_logged,
                         group_name,
                         float(np.nanmin(chunk)),
                         float(np.nanmax(chunk)),
                         float(np.nanmean(chunk)),
                         np.array2string(chunk[: min(8, len(chunk))].reshape(-1), precision=3),
-                        float(np.nanmin(converted)),
-                        float(np.nanmax(converted)),
-                        self.gripper_output_mode,
-                        self.gripper_binary_threshold,
                         self.clamp_gripper,
                         self.gripper_threshold,
                     )
@@ -928,8 +885,6 @@ class MolmoBotRBY1MultitaskPolicy(MolmoBotRBY1DoorOpeningPolicy):
                     action[group_name] = np.where(
                         selected_action >= self.gripper_threshold, 100.0, -100.0
                     ).astype(selected_action.dtype)
-                elif "gripper" in group_name:
-                    action[group_name] = self._convert_gripper_action(selected_action)
                 else:
                     action[group_name] = selected_action
                 start_idx += dim
@@ -977,10 +932,6 @@ class MolmoBotRBY1PickPnPPolicyConfig(MolmoBotRBY1PolicyConfig):
     """Policy config for MolmoBot RBY1 pick+pnp with torso, no points, no conditioning."""
 
     clamp_gripper: bool = False  # Disable gripper clamping for pick/pnp
-    gripper_output_mode: str = "raw"
-    gripper_binary_threshold: float = 0.0
-    gripper_open_position: float = -0.05
-    gripper_closed_position: float = 0.0
 
     action_move_group_names: list[str] = [
         "base", "left_arm", "left_gripper", "right_arm", "right_gripper", "torso",
