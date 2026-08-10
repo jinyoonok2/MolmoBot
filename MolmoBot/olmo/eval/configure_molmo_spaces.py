@@ -36,7 +36,7 @@ class SynthVLAPolicy(InferencePolicy, StatefulPolicy):
         config: MlSpacesExpConfig,
         task_type: str,
     ):
-        super().__init__(config)
+        super().__init__(config, task_type)
         self.task = task_type
         self.camera_names = config.policy_config.camera_names
         self.action_move_group_names = config.policy_config.action_move_group_names
