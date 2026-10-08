@@ -91,4 +91,4 @@ python calculate_stats.py RBY1PickAndPlaceDataGenConfig/part0/train --keys actio
 
 ## Changes in the RB-Y1 compatibility fork
 
-See [the change and reproduction record](docs/FORK_CHANGES.md) for exact source commits, compatibility fixes, affected files, paired MolmoSpaces setup, and reconstruction commands. The retained project branch is `rby1-compatible`.
+See [the change and reproduction record](FORK_CHANGES.md) for exact source commits, compatibility fixes, affected files, paired MolmoSpaces setup, and reconstruction commands. The retained project branch is `rby1-compatible`.
